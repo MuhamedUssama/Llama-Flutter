@@ -4,8 +4,12 @@
 #include <atomic>
 #include <ctime>
 #include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <mutex>
 #include <android/log.h>
 #include "llama.cpp/include/llama.h"
+#include "ggml-backend.h"
 #include <vulkan/vulkan.h>
 
 
@@ -19,6 +23,45 @@ static const llama_vocab* g_vocab = nullptr;
 static llama_sampler* g_sampler = nullptr;
 static std::atomic<bool> g_stop_flag{false};
 static int g_n_past = 0;  // Track the number of tokens already in KV cache
+
+// Keep upstream's actual offload counts and backend errors visible in logcat.
+// Suppress progress dots, debug output and routine generation messages.
+static void nativeLlamaLog(ggml_log_level level, const char* text, void*) {
+    if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN ||
+        (level == GGML_LOG_LEVEL_INFO &&
+         (strstr(text, "offload") || strstr(text, "ggml_vulkan")))) {
+        const int priority = level == GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR :
+                             level == GGML_LOG_LEVEL_WARN ? ANDROID_LOG_WARN : ANDROID_LOG_INFO;
+        __android_log_write(priority, LOG_TAG, text);
+    }
+}
+
+static void initializeBackends() {
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        llama_log_set(nativeLlamaLog, nullptr);
+#ifdef GGML_USE_VULKAN
+        LOGI("Vulkan backend compiled: yes");
+#else
+        LOGI("Vulkan backend compiled: no");
+#endif
+
+        // The vendored backend calls Vulkan 1.1 entry points and requires 1.2.
+        // Skip registration before it can call a missing loader entry point.
+        uint32_t loaderVersion = VK_API_VERSION_1_0;
+        auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+        if (!enumerateVersion || enumerateVersion(&loaderVersion) != VK_SUCCESS ||
+            loaderVersion < VK_API_VERSION_1_2) {
+            LOGI("Vulkan unavailable: loader API %u.%u.%u; backend requires 1.2. Using CPU",
+                 VK_VERSION_MAJOR(loaderVersion), VK_VERSION_MINOR(loaderVersion),
+                 VK_VERSION_PATCH(loaderVersion));
+            // Use the vendored registry's existing runtime disable mechanism.
+            setenv("GGML_DISABLE_VULKAN", "1", 1);
+        }
+        llama_backend_init();
+    });
+}
 
 // Helper function to validate UTF-8 strings
 static bool isValidUTF8(const char* str, size_t len) {
@@ -257,20 +300,56 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     jobject progress_callback) {
     
     const char* model_path = env->GetStringUTFChars(path, nullptr);
+    if (!model_path) return;
     LOGI("Loading model: %s", model_path);
+
+    try {
+        initializeBackends();
+    } catch (const std::exception& error) {
+        LOGE("Backend initialization failed: %s", error.what());
+        env->ReleaseStringUTFChars(path, model_path);
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), error.what());
+        return;
+    }
+
+    LOGI("Requested GPU layers: %lld", static_cast<long long>(n_gpu_layers));
+    ggml_backend_reg_t vulkan = ggml_backend_reg_by_name("Vulkan");
+    const size_t vulkanDeviceCount = vulkan ? ggml_backend_reg_dev_count(vulkan) : 0;
+    LOGI("Vulkan backend available: %s (%zu devices)",
+         vulkanDeviceCount > 0 ? "yes" : "no", vulkanDeviceCount);
+    for (size_t i = 0; i < vulkanDeviceCount; ++i) {
+        auto device = ggml_backend_reg_dev_get(vulkan, i);
+        LOGI("Vulkan device: %s (%s)", ggml_backend_dev_description(device),
+             ggml_backend_dev_name(device));
+    }
 
     // Model parameters
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
+    ggml_backend_dev_t cpuOnlyDevices[] = {nullptr};
+    if (n_gpu_layers == 0 || vulkanDeviceCount == 0) {
+        // Exclude GPU devices altogether, including opportunistic op offload
+        // and GPU host buffers, when CPU execution is requested or required.
+        model_params.devices = cpuOnlyDevices;
+        model_params.n_gpu_layers = 0;
+        if (n_gpu_layers > 0) {
+            LOGI("GPU offload unavailable: no usable Vulkan backend (requires Vulkan 1.2 and 16-bit storage). Falling back to CPU");
+        } else {
+            LOGI("CPU-only model load requested");
+        }
+    }
     
     // Load model
     g_model = llama_model_load_from_file(model_path, model_params);
     env->ReleaseStringUTFChars(path, model_path);
     
     if (!g_model) {
-        LOGE("Failed to load model");
+        LOGE("Failed to load model (GPU layers: %d); check model, driver and available RAM. Retry with gpuLayers=0 if GPU was requested",
+             model_params.n_gpu_layers);
         jclass exception = env->FindClass("java/lang/RuntimeException");
-        env->ThrowNew(exception, "Failed to load model");
+        env->ThrowNew(exception, model_params.n_gpu_layers > 0 ?
+            "Failed to load model with Vulkan offload; check driver/memory or retry with gpuLayers=0" :
+            "Failed to load model");
         return;
     }
 
@@ -279,17 +358,30 @@ Java_com_write4me_llama_1flutter_1android_LlamaFlutterAndroidPlugin_nativeLoadMo
     ctx_params.n_ctx = ctx_size;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
+    if (model_params.n_gpu_layers == 0) {
+        ctx_params.offload_kqv = false;
+        ctx_params.op_offload = false;
+    }
     
     // Memory optimization: reduce memory usage by limiting batch processing
     ctx_params.n_batch = 512;  // Process smaller batches to reduce memory spikes
 
     // Create context (using new API)
-    g_ctx = llama_init_from_model(g_model, ctx_params);
+    try {
+        g_ctx = llama_init_from_model(g_model, ctx_params);
+    } catch (const std::exception& error) {
+        LOGE("Context initialization failed: %s", error.what());
+        g_ctx = nullptr;
+    }
     if (!g_ctx) {
+        LOGE("Failed to create context (GPU layers: %d); retry with gpuLayers=0 if GPU was requested",
+             model_params.n_gpu_layers);
         llama_model_free(g_model);
         g_model = nullptr;
         jclass exception = env->FindClass("java/lang/RuntimeException");
-        env->ThrowNew(exception, "Failed to create context");
+        env->ThrowNew(exception, model_params.n_gpu_layers > 0 ?
+            "Failed to create Vulkan context; check driver/memory or retry with gpuLayers=0" :
+            "Failed to create context");
         return;
     }
 

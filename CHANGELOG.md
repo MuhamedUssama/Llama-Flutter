@@ -1,3 +1,17 @@
+## Unreleased (Vulkan fork)
+
+- Enable the Vulkan backend in the Android llama.cpp native build, with pinned
+  Vulkan-Hpp/SPIR-V headers and host shader generation using SDK/PATH/NDK `glslc`.
+- Positive `gpuLayers` requests now reach a compiled Vulkan backend for layer
+  offload on compatible drivers; the vendored backend requires Vulkan 1.2+.
+- Initialize llama.cpp backends before model loading and log runtime Vulkan
+  availability, device names, requested layers and upstream actual offload counts.
+- Preserve CPU-only execution for `gpuLayers: 0`, fall back to CPU when no usable
+  Vulkan backend exists, and return load errors for driver/allocation failures.
+- Resolve Vulkan 1.1 feature queries dynamically to retain Android API 26 linking.
+- Add ARM64 native build and Vulkan registration/linkage verification in CI.
+- No public Dart/Pigeon API changes; GPU recommendations remain unchanged.
+
 ## 0.2.6 (July 20, 2026)
 
 ### Fixed
