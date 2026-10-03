@@ -6308,7 +6308,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 #endif
 
-        vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
         device->pipeline_executable_properties_support = pipeline_executable_properties_support;
 
@@ -6914,7 +6914,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     }
 #endif
 
-    vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
 
     fp16 = fp16 && vk12_features.shaderFloat16;
 
@@ -18177,13 +18177,13 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
         ggml_vk_instance_init();
         return &reg;
     } catch (const vk::SystemError& e) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
+        GGML_LOG_WARN("ggml_vulkan: backend initialization failed: %s\n", e.what());
         return nullptr;
     } catch (const std::exception &e) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: " << e.what());
+        GGML_LOG_WARN("ggml_vulkan: backend initialization failed: %s\n", e.what());
         return nullptr;
     } catch (...) {
-        VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: unknown exception during Vulkan init");
+        GGML_LOG_WARN("ggml_vulkan: unknown exception during backend initialization\n");
         return nullptr;
     }
 }
@@ -18239,6 +18239,15 @@ static bool ggml_vk_instance_debug_utils_ext_available(
 }
 
 static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
+    // A newer Android loader does not imply a Vulkan 1.2 physical device.
+    const auto properties = vkdev.getProperties();
+    if (properties.apiVersion < VK_API_VERSION_1_2) {
+        GGML_LOG_WARN("ggml_vulkan: skipping %s: device API %u.%u.%u; Vulkan 1.2 required\n",
+                      properties.deviceName.data(), VK_VERSION_MAJOR(properties.apiVersion),
+                      VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion));
+        return false;
+    }
+
     VkPhysicalDeviceFeatures2 device_features2;
     device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 
@@ -18247,9 +18256,14 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
     vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     device_features2.pNext = &vk11_features;
 
-    vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
 
-    return vk11_features.storageBuffer16BitAccess;
+    if (!vk11_features.storageBuffer16BitAccess) {
+        GGML_LOG_WARN("ggml_vulkan: skipping %s: 16-bit storage buffers unsupported\n",
+                      properties.deviceName.data());
+        return false;
+    }
+    return true;
 }
 
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {

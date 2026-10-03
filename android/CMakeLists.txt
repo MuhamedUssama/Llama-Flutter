@@ -19,7 +19,10 @@ endif()
 # llama.cpp options
 set(GGML_CPU_AARCH64 ON CACHE BOOL "Enable ARM64 support")
 set(GGML_DOTPROD ON CACHE BOOL "Enable ARM NEON dot product")
-set(GGML_VULKAN OFF CACHE BOOL "Enable Vulkan GPU backend")
+set(GGML_VULKAN ON CACHE BOOL "Enable Vulkan GPU backend" FORCE)
+# Keep backend registration linked into ggml; Android does not search desktop
+# backend plugin directories when System.loadLibrary loads llama_jni.
+set(GGML_BACKEND_DL OFF CACHE BOOL "Link backends into ggml" FORCE)
 set(GGML_STATIC OFF CACHE BOOL "Build as shared library")
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries")
 
@@ -29,14 +32,13 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable examples")
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable server")
 
 # Add llama.cpp
+include(cmake/VulkanDependencies.cmake)
 add_subdirectory(src/main/cpp/llama.cpp)
 
 # JNI wrapper library - simplified without common library
 add_library(llama_jni SHARED
     src/main/cpp/jni_wrapper.cpp
 )
-
-find_library(VULKAN_LIB vulkan)
 
 target_link_libraries(llama_jni
     llama

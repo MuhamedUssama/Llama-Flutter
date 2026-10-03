@@ -16,7 +16,7 @@ Run GGUF models on Android with [llama.cpp](https://github.com/ggerganov/llama.c
 - **Auto-Detection** - Chat templates detected from model filename
 - **Vulkan GPU Acceleration** - Real GPU inference via `GGML_VULKAN` on supported devices
 - **GPU Detection API** - `detectGpu()` returns device name, Vulkan support, memory info, and a recommended layer count
-- **Latest llama.cpp** - Built on March 4, 2026 llama.cpp release (b8201)
+- **llama.cpp** - Vendored b10068 sources, built with the Vulkan backend
 - **ARM64 Optimized** - NEON and dot product optimizations enabled
 
 ## Requirements
@@ -25,6 +25,16 @@ Run GGUF models on Android with [llama.cpp](https://github.com/ggerganov/llama.c
 - Dart SDK 3.3.0+
 - Android API 26+ (Android 8.0)
 - NDK r27+ (for 16KB page size support)
+- ARM64 (`arm64-v8a`)
+- A host C/C++ compiler for the Vulkan shader generator. The build uses
+  `glslc` from `VULKAN_SDK`/`PATH`, or the selected NDK's `shader-tools`.
+- Network access on the first native configure to fetch SHA-256-checked
+  Vulkan and SPIR-V headers pinned to `vulkan-sdk-1.4.350.0`.
+
+GPU inference additionally requires a driver usable by the vendored backend:
+Vulkan 1.2 or newer and 16-bit storage buffer support. CPU inference remains
+available when those requirements are not met. A Vulkan 1.1 device can pass
+`detectGpu()` and still be unavailable to this inference backend.
 
 ## Installation
 
@@ -32,7 +42,8 @@ Run GGUF models on Android with [llama.cpp](https://github.com/ggerganov/llama.c
 
 ```yaml
 dependencies:
-  llama_flutter_android: ^0.2.0
+  llama_flutter_android:
+    path: ../Llama-Flutter # Relative to the consuming app's pubspec.yaml
 ```
 
 2) If your app uses R8/proguard (`minifyEnabled true`), create or extend
@@ -166,7 +177,7 @@ print('Recommended layers: ${gpu.recommendedGpuLayers}'); // 0, 16, or 99
 // Use the recommendation (or override it)
 await controller.loadModel(
   modelPath: '/path/to/model.gguf',
-  gpuLayers: gpu.recommendedGpuLayers, // 0 = CPU only, 99 = full GPU offload
+  gpuLayers: gpu.recommendedGpuLayers, // Recommendation only; benchmark smaller values first
 );
 ```
 
@@ -174,11 +185,84 @@ await controller.loadModel(
 
 | Value | Meaning |
 |---|---|
-| `0` | CPU only — no Vulkan, Mali GPU, or insufficient RAM |
+| `0` | CPU only — no Vulkan capability or insufficient RAM |
 | `16` | Partial offload — Vulkan supported but limited RAM/VRAM |
 | `99` | Full offload — llama.cpp clamps to model's actual layer count |
 
 > **Note:** `deviceLocalMemoryBytes` on Android equals total system RAM (unified memory architecture), not dedicated VRAM. Use `freeRamBytes` for memory pressure decisions.
+
+`detectGpu()` reports Vulkan capabilities and a model-independent memory
+recommendation; it does not initialize llama.cpp's inference backend or prove
+that a particular model can be offloaded. The existing `0`/`16`/`99` heuristic
+is unchanged, and Mali devices are not excluded from recommendations.
+
+This fork compiles Vulkan inference into the native libraries. `gpuLayers: 0`
+(also the default when omitted) selects CPU-only execution. Positive values
+request Vulkan layer offload when the backend is available; `99` is a high
+request which llama.cpp clamps to the model's offloadable layer count.
+GPU allocations on Android's unified memory still consume system RAM.
+
+If backend registration fails or no compatible Vulkan device is found, loading
+falls back to CPU and logs the reason. Model/context allocation failures return
+a load error; retry explicitly with `gpuLayers: 0`. Driver bugs can still cause
+native failures during inference, and enabling Vulkan does not guarantee better
+performance on older Mali GPUs.
+
+For a first manual benchmark on an older Mali device, compare `0`, `4`, and `8`
+with the same model, prompt, context size and thread count. Dispose the loaded
+model between runs. Start with partial offload instead of `99`:
+
+```dart
+await controller.loadModel(
+  modelPath: modelPath,
+  contextSize: 2048,
+  threads: 4,
+  gpuLayers: 4,
+);
+```
+
+For the Galaxy A51 reporting Vulkan 1.1.213, expect CPU fallback unless its
+actual runtime driver satisfies this backend's Vulkan 1.2 requirements.
+`recommendedGpuLayers = 16` alone does not establish backend compatibility.
+
+Native logcat messages under `LlamaJNI` report compiled backend support,
+runtime availability, registered GPU names, requested layers, and fallback/load
+errors. Upstream `offloaded X/Y layers to GPU` messages report the actual
+offload count; a requested positive count alone is not proof of GPU execution.
+
+### Native build verification (no device required)
+
+The Gradle plugin builds `android/CMakeLists.txt` from source and packages the
+JNI library and its llama/ggml/Vulkan backend dependencies. It keeps the existing
+ARM64 ABI and Android API 26 minimum. No prebuilt CPU-only libraries are bundled.
+
+For a standalone package-level build, set `ANDROID_NDK` to your selected NDK
+r27+ and put CMake 3.22.1+ and Ninja on `PATH`, then run from the package root:
+
+```sh
+cmake -S android -B build/android-vulkan -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+  -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS=-fvisibility=hidden
+cmake --build build/android-vulkan --target llama_jni --parallel 4
+```
+
+Shaders are generated on the build host and embedded in `libggml-vulkan.so`;
+no shader compiler is needed on the device. If `glslc` is unavailable, install
+shaderc/the Vulkan SDK or pass `-DVulkan_GLSLC_EXECUTABLE=/path/to/host/glslc`.
+Optional shader features are enabled only when that compiler successfully
+compiles their probes. Windows also needs a host compiler available to CMake
+(for MSVC, use its developer command prompt).
+
+For offline builds, prefetch the pinned source archives and pass
+`-DFETCHCONTENT_SOURCE_DIR_LLAMA_VULKAN_HEADERS=/path/to/Vulkan-Headers` and
+`-DFETCHCONTENT_SOURCE_DIR_LLAMA_SPIRV_HEADERS=/path/to/SPIRV-Headers`.
+
+Use the NDK's `llvm-readelf` to inspect the result: `libggml.so` must depend on
+`libggml-vulkan.so` and import `ggml_backend_vk_reg`; `libggml-vulkan.so` must
+export that registration function and depend on Android's `libvulkan.so`.
+The Android Vulkan CI workflow checks this dependency chain after compilation.
 
 ## Architecture
 
